@@ -1,87 +1,92 @@
 import streamlit as st
 import os
 import json
+from groq import Groq
 from processor import process_and_vectorize_audio
 from rag_backend import generate_rag_response
 
-# --- UI Config ---
-st.set_page_config(page_title="RAG Audio System", layout="wide")
-st.title("🎙️ Arabic Audio RAG System")
+from dotenv import load_dotenv
+
+load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    raise ValueError("🚨 GROQ_API_KEY not found! Please check your .env file.")
+
+st.set_page_config(page_title="Multimodal RAG System", layout="wide")
+st.title("🎙️ Multimodal Audio RAG System")
 
 os.makedirs("uploads", exist_ok=True)
 META_FILE = os.path.join("database", "rag_metadata.json")
 
-# --- Sidebar: File Upload ---
+client = Groq(api_key=api_key)
+
+# --- Sidebar ---
 with st.sidebar:
-    st.header("📂 Upload Audio")
-    uploaded_file = st.file_uploader("Choose an MP3/WAV file", type=["mp3", "wav"])
-    
-    if uploaded_file is not None:
+    st.header("📂 Upload Audio to Library")
+    uploaded_file = st.file_uploader("Upload an MP3/WAV", type=["mp3", "wav"])
+    if uploaded_file and st.button("Process & Index"):
         file_path = os.path.join("uploads", uploaded_file.name)
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
-        st.audio(file_path)
-        
-        if st.button("Process & Add to Database"):
-            with st.spinner("Processing audio, transcribing, and embedding... This may take a moment."):
-                metadata = process_and_vectorize_audio(file_path)
-                st.success(f"✅ Processed: {metadata['title']}")
+        with st.spinner("Slicing audio, transcribing, and embedding..."):
+            metadata = process_and_vectorize_audio(file_path)
+            st.success(f"✅ Indexed: {metadata['title']}")
 
-# --- Main Area: Tabs ---
-tab1, tab2 = st.tabs(["💬 RAG Chat Search", "📚 Document Library"])
+# --- Main Area ---
+tab1, tab2 = st.tabs(["💬 Voice & Text Search", "📚 Document Library"])
 
-# --- TAB 1: RAG Search ---
 with tab1:
-    st.header("Ask questions about your uploaded audio files")
+    st.header("Search your Audio Database")
     
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # 1. Input Methods (Text or Microphone)
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        text_query = st.chat_input("Type your question here...")
+    with col2:
+        mic_query = st.audio_input("🎤 Or record your question via Microphone")
 
-    # Display chat history
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    final_query = None
 
-    # Chat input
-    if prompt := st.chat_input("اسأل أي شيء عن الملفات الصوتية..."):
-        # Add user message to UI
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # Determine which input was used
+    if text_query:
+        final_query = text_query
+    elif mic_query:
+        with st.spinner("Transcribing your voice..."):
+            # Save mic audio temp file
+            with open("temp_mic.wav", "wb") as f:
+                f.write(mic_query.getbuffer())
+            # Transcribe the mic audio using Whisper
+            with open("temp_mic.wav", "rb") as file:
+                transcription = client.audio.transcriptions.create(
+                    file=("temp_mic.wav", file.read()),
+                    model="whisper-large-v3", language="ar", response_format="text"
+                )
+            final_query = transcription.strip()
+            st.info(f"🗣️ You asked: **{final_query}**")
 
-        # Generate RAG response
-        with st.chat_message("assistant"):
-            with st.spinner("Searching database..."):
-                answer, sources = generate_rag_response(prompt)
-                
-                # Format the response with sources
-                full_response = f"{answer}\n\n"
-                if sources:
-                    full_response += f"**المصادر:** `{', '.join(sources)}`"
-                
-                st.markdown(full_response)
-        
-        # Save assistant message to history
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+    # 2. Process the Query
+    if final_query:
+        with st.spinner("Searching audio embeddings..."):
+            answer, audio_sources = generate_rag_response(final_query)
+            
+            st.markdown("### 🤖 Answer:")
+            st.write(answer)
+            
+            if audio_sources:
+                st.markdown("### 🎧 Audio Evidence (Top Matches):")
+                for i, source in enumerate(audio_sources):
+                    with st.expander(f"🔊 Listen to Match {i+1} (From: {os.path.basename(source['source_file'])})"):
+                        st.audio(source["chunk_file"])
+                        st.write(f"**Transcript:** {source['text']}")
 
-# --- TAB 2: Document Library ---
 with tab2:
     st.header("Processed Audio Library")
-    
     if os.path.exists(META_FILE):
         with open(META_FILE, "r", encoding="utf-8") as f:
             documents = json.load(f)
-            
-        if documents:
-            for doc in documents:
-                with st.expander(f"📄 {doc['title']} ({doc['file_link']})"):
-                    st.subheader("الملخص (Summary)")
-                    st.write(doc['summary'])
-                    st.subheader("النص الكامل (Full Text)")
-                    st.write(doc['full_text'])
-        else:
-            st.info("No documents processed yet. Upload a file in the sidebar.")
+        for doc in documents:
+            with st.expander(f"📄 {doc['title']}"):
+                st.write("**الملخص:**", doc['summary'])
+                st.write("**النص:**", doc['full_text'])
     else:
-        st.info("Database not initialized yet.")
+        st.info("Library is empty.")
