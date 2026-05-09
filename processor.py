@@ -27,32 +27,67 @@ for db_file in [META_FILE, VECTOR_FILE]:
         with open(db_file, "w", encoding="utf-8") as f:
             json.dump([], f)
 
-def correct_and_summarize(raw_text):
+def extract_chunk_facts(chunk_text):
     prompt = f"""
-أنت خبير لغوي. قم بتصحيح النص التالي إملائياً ونحوياً، واستنتج له عنواناً، واكتب ملخصاً قصيراً له.
-أخرج الإجابة حصراً بهذا التنسيق:
-العنوان: [العنوان هنا]
-الملخص: [الملخص هنا]
-النص المصحح: [النص هنا]
+أنت مساعد دقيق جداً. استخرج أهم المعلومات، الأرقام، والحقائق من هذا المقطع الصوتي القصير.
+تجاهل الحشو والكلام الجانبي، وركز فقط على الجوهر.
+إذا كان المقطع لا يحتوي على معلومات مهمة، اكتب "لا توجد معلومات جوهرية".
 
-النص الأصلي: {raw_text}
+اكتب الإجابة في شكل نقاط (Bullet points) قصيرة ومباشرة:
+{chunk_text}
 """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1
     )
+    return response.choices[0].message.content.strip()
+
+def merge_extracted_facts(all_facts):
+    prompt = f"""
+أنت خبير في التلخيص المتقدم (NLP Summarization Expert). إليك قائمة عشوائية ومطولة من النقاط التي تم استخراجها تباعاً من تسجيل صوتي.
+
+مهمتك هي "التوليف" (Synthesis) وليس مجرد الجمع. قم بدمج المعلومات المترابطة في نقاط كثيفة وغنية بالمعلومات، وتخلص من الحشو والمعلومات غير المهمة.
+
+الشروط الصارمة:
+1. الحد الأقصى: اكتب من 5 إلى 7 نقاط رئيسية كحد أقصى. لا تتجاوز 7 نقاط تحت أي ظرف.
+2. الكثافة والدمج: ادمج الحقائق المترابطة في نقطة واحدة غنية. (مثال: بدلاً من كتابة وزن الحجر في نقطة، وارتفاع الهرم في نقطة، ادمج كل الأرقام الهندسية في نقطة واحدة تتحدث عن "الإعجاز الهندسي والأرقام").
+3. الحذف: استبعد الأفكار المكررة، أو الاستنتاجات الضعيفة، أو الكلام العابر الذي لا يضيف قيمة علمية أو تاريخية.
+4. استنتج "عنواناً" دقيقاً يعبر عن جوهر التسجيل بالكامل.
+
+المخرجات يجب أن تكون بهذا التنسيق حصراً:
+العنوان: [ضع العنوان هنا]
+النقاط:
+- [النقطة الشاملة الأولى]
+- [النقطة الشاملة الثانية]
+
+النقاط الخام المستخرجة:
+{all_facts}
+"""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2 # Keep it low so the model respects the 7-point limit
+    )
     output = response.choices[0].message.content.strip()
     
+    # Parse the output
     lines = output.split('\n')
-    title, summary, corrected_text = "بدون عنوان", "", output
+    title = "بدون عنوان"
+    final_points = ""
+    
     for i, line in enumerate(lines):
-        if line.startswith("العنوان:"): title = line.replace("العنوان:", "").strip()
-        elif line.startswith("الملخص:"): summary = line.replace("الملخص:", "").strip()
-        elif line.startswith("النص المصحح:"): 
-            corrected_text = "\n".join(lines[i:]).replace("النص المصحح:", "").strip()
+        if line.startswith("العنوان:"): 
+            title = line.replace("العنوان:", "").strip()
+        elif line.startswith("النقاط:"): 
+            final_points = "\n".join(lines[i+1:]).strip()
             break
-    return title, summary, corrected_text
+            
+    # Fallback in case the model ignores the format
+    if not final_points:
+        final_points = output
+        
+    return title, final_points
 
 def process_and_vectorize_audio(audio_path):
     print(f"Processing {audio_path}...")
@@ -61,6 +96,7 @@ def process_and_vectorize_audio(audio_path):
     
     chunk_length_ms = 30 * 1000  # Slice audio into 30-second blocks
     full_raw_text = ""
+    all_chunks_facts = ""
     new_vectors = []
     
     # 1. Slice audio, transcribe, and embed each physical chunk
@@ -86,6 +122,10 @@ def process_and_vectorize_audio(audio_path):
         text = transcription.strip()
         if text:
             full_raw_text += text + " "
+            
+            chunk_facts = extract_chunk_facts(text)
+            all_chunks_facts += f"\n- {chunk_facts}"
+
             # Embed the text of this specific audio chunk
             embedding = embedder.encode(text).tolist()
             new_vectors.append({
@@ -97,9 +137,16 @@ def process_and_vectorize_audio(audio_path):
                 "embedding": embedding
             })
 
-    # 2. Correct and summarize the full text for the library view
-    title, summary, final_text = correct_and_summarize(full_raw_text)
-    metadata = {"file_link": audio_path, "title": title, "summary": summary, "full_text": final_text}
+    print("Merging facts into final bullet points...")
+    title, final_summary_points = merge_extracted_facts(all_chunks_facts)
+    
+    # We now pass `full_raw_text` directly! No LLM rewriting.
+    metadata = {
+        "file_link": audio_path, 
+        "title": title, 
+        "summary": final_summary_points, 
+        "full_text": full_raw_text.strip() 
+    }
 
     # 3. Save to Databases
     with open(META_FILE, "r", encoding="utf-8") as f:
